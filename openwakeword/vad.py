@@ -64,21 +64,30 @@ class VAD():
                     "models",
                     "silero_vad.onnx"
                  ),
-                 n_threads: int = 1
+                 n_threads: int = 1,
+                 device: str = "cpu"
                  ):
         """Initialize the VAD model object.
 
             Args:
                 model_path (str): The path to the Silero VAD ONNX model.
                 n_threads (int): The number of threads to use for the VAD model.
+                device (str): The device to run inference on, either "cpu" or "gpu"
+                              (default "cpu"). When "gpu", the session is created with
+                              the CUDAExecutionProvider, falling back to the
+                              CPUExecutionProvider if CUDA is unavailable at runtime.
         """
 
         # Initialize the ONNX model
         sessionOptions = ort.SessionOptions()
         sessionOptions.inter_op_num_threads = n_threads
         sessionOptions.intra_op_num_threads = n_threads
+        # When device == "gpu", prefer CUDA but keep CPU in the list as an explicit
+        # fallback so a host without a working CUDA provider still loads.
+        vad_providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                         if device == "gpu" else ["CPUExecutionProvider"])
         self.model = ort.InferenceSession(model_path, sess_options=sessionOptions,
-                                          providers=["CPUExecutionProvider"])
+                                          providers=vad_providers)
 
         # Create buffer
         self.prediction_buffer: deque = deque(maxlen=125)  # buffer lenght of 10 seconds

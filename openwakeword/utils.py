@@ -80,16 +80,21 @@ class AudioFeatures():
             sessionOptions.inter_op_num_threads = ncpu
             sessionOptions.intra_op_num_threads = ncpu
 
+            # When device == "gpu", prefer CUDA but keep CPU in the list as an explicit
+            # fallback so a host without a working CUDA provider still loads instead of
+            # raising.
+            onnx_providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                              if device == "gpu" else ["CPUExecutionProvider"])
+
             # Melspectrogram model
             self.melspec_model = ort.InferenceSession(melspec_model_path, sess_options=sessionOptions,
-                                                      providers=["CUDAExecutionProvider"] if device == "gpu" else ["CPUExecutionProvider"])
+                                                      providers=onnx_providers)
             self.onnx_execution_provider = self.melspec_model.get_providers()[0]
             self.melspec_model_predict = lambda x: self.melspec_model.run(None, {'input': x})
 
             # Audio embedding model
             self.embedding_model = ort.InferenceSession(embedding_model_path, sess_options=sessionOptions,
-                                                        providers=["CUDAExecutionProvider"] if device == "gpu"
-                                                        else ["CPUExecutionProvider"])
+                                                        providers=onnx_providers)
             self.embedding_model_predict = lambda x: self.embedding_model.run(None, {'input_1': x})[0].squeeze()
 
         elif inference_framework == "tflite":
@@ -459,6 +464,35 @@ class AudioFeatures():
         else:
             return self.feature_buffer[int(-1*n_feature_frames):, :][None, ].astype(np.float32)
 
+    def get_raw_audio(self, n_seconds: float = 3.0):
+        """Return the most recent `n_seconds` of raw audio from the
+        rolling input buffer.
+
+        `predict()` feeds every incoming chunk through this preprocessor,
+        which keeps the last ~10 seconds of raw 16 kHz PCM in
+        `raw_data_buffer` (it is used internally to compute the streaming
+        melspectrogram). This accessor exposes that buffer so callers can
+        retrieve the audio that a wake word fired on — without
+        re-capturing it — for downstream processing such as
+        transcription or speaker verification.
+
+        Args:
+            n_seconds (float): How many seconds of recent audio to
+                return. Clamped to what the buffer actually holds, so a
+                freshly-started model simply returns less.
+
+        Returns:
+            np.ndarray: int16 PCM samples, 16 kHz mono — the most recent
+                `n_seconds` (or fewer) of buffered audio. Empty array if
+                nothing has been buffered yet.
+        """
+        n_samples = int(n_seconds * 16000)
+        if n_samples <= 0 or len(self.raw_data_buffer) == 0:
+            return np.empty(0, dtype=np.int16)
+        return np.array(
+            list(self.raw_data_buffer)[-n_samples:], dtype=np.int16
+        )
+
     def __call__(self, x):
         return self._streaming_features(x)
 
@@ -671,6 +705,38 @@ def download_models(
             if not os.path.exists(os.path.join(target_directory, official_model_url.split("/")[-1])):
                 download_file(official_model_url, target_directory)
                 download_file(official_model_url.replace(".tflite", ".onnx"), target_directory)
+
+    # Warm the modelscope cache for any requested speaker-verification
+    # models. Unlike the wakeword/VAD/feature models above, the
+    # speaker-verification backend (3D-Speaker CAM++) is distributed via
+    # modelscope, not GitHub release assets — the modelscope SDK owns
+    # the fetch + cache. Constructing the SpeakerVerification class
+    # would also trigger the download lazily; doing it here lets an
+    # operator pre-fetch everything in one download_models() call. The
+    # whole block is skipped (and modelscope is never imported) unless a
+    # speaker model name is explicitly requested, so a plain
+    # openWakeWord install without the speaker-verification extra is
+    # unaffected.
+    requested_speaker_models = [
+        name for name in model_names if name in openwakeword.SPEAKER_MODELS
+    ]
+    for speaker_model_name in requested_speaker_models:
+        modelscope_id = openwakeword.SPEAKER_MODELS[speaker_model_name]["modelscope_id"]
+        try:
+            from modelscope.hub.snapshot_download import snapshot_download  # type: ignore[import-untyped]
+            snapshot_download(modelscope_id)
+        except ImportError:
+            logging.warning(
+                "download_models: speaker model %r requested but modelscope is "
+                "not installed; install the `speaker-verification` extra "
+                "(it is fetched lazily on first SpeakerVerification use anyway)",
+                speaker_model_name,
+            )
+        except Exception as e:  # pragma: no cover — network/SDK errors
+            logging.warning(
+                "download_models: failed to warm modelscope cache for %r: %s",
+                speaker_model_name, e,
+            )
 
 
 # Handle deprecated arguments and naming (thanks to https://stackoverflow.com/a/74564394)

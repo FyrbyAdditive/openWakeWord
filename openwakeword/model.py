@@ -23,9 +23,44 @@ import logging
 import functools
 import pickle
 from collections import deque, defaultdict
+from dataclasses import dataclass, field
 from functools import partial
 import time
 from typing import List, Union, DefaultDict, Dict
+
+
+@dataclass
+class PredictionResult:
+    """Structured result returned by Model.predict() when speaker
+    verification is enabled (or when return_result_object=True is
+    passed explicitly).
+
+    With speaker verification *disabled* and return_result_object not
+    set, predict() returns the bare `scores` dict exactly as it always
+    has — existing openWakeWord code is unaffected. This object is the
+    richer shape for callers that have opted into speaker verification
+    and need to know *who* spoke, not just *that* a wake word fired.
+
+    Attributes:
+        scores: The per-model wake-word scores in [0, 1] — identical to
+            the dict predict() returns in its classic form.
+        speaker_id: The id of the matched enrolled speaker, or "" when
+            no wake word fired this frame, no speaker cleared the
+            similarity threshold, or speaker verification is off.
+        speaker_score: The cosine similarity of the best speaker match.
+            -1.0 when speaker verification did not run (no wake word
+            fired) or the enrollment catalogue is empty.
+        speaker_quality: An RMS-energy quality estimate in [0, 1] of the
+            audio segment the speaker embedding was computed from. 0.0
+            when speaker verification did not run. A low value means a
+            quiet/sparse segment — a weak basis for identification even
+            if the cosine match looks high.
+    """
+
+    scores: Dict[str, float] = field(default_factory=dict)
+    speaker_id: str = ""
+    speaker_score: float = -1.0
+    speaker_quality: float = 0.0
 
 
 # Define main model class
@@ -43,7 +78,12 @@ class Model():
             vad_threshold: float = 0,
             custom_verifier_models: dict = {},
             custom_verifier_threshold: float = 0.1,
+            speaker_verification: bool = False,
+            speaker_enrollments: dict = {},
+            speaker_verification_threshold: float = 0.65,
+            speaker_verification_model: str = "campplus_sv",
             inference_framework: str = "tflite",
+            device: str = "cpu",
             **kwargs
             ):
         """Initialize the openWakeWord model object.
@@ -74,10 +114,38 @@ class Model():
                                                from a model for a given frame is greater than this value, the
                                                associated custom verifier model will also predict on that frame, and
                                                the verifier score will be returned.
+            speaker_verification (bool): Whether to enable optional speaker verification — identifying *which*
+                                         enrolled speaker spoke the wake word, not just *that* one was spoken.
+                                         When True, after a wake word fires, the audio that triggered it is run
+                                         through a speaker-embedding model and cosine-matched against the
+                                         enrolled-speaker catalogue; predict() then returns a PredictionResult
+                                         (carrying .speaker_id / .speaker_score) instead of the bare scores
+                                         dict. Disabled by default — when off, none of the speaker-verification
+                                         code runs and its (heavy) modelscope/torch dependencies are never
+                                         imported. Requires the `speaker-verification` extra.
+            speaker_enrollments (dict): The enrolled-speaker catalogue, as
+                                        {speaker_id: [embedding, ...]}. Each embedding is a pre-computed
+                                        speaker-embedding vector — openWakeWord stays pure-inference, so
+                                        enrollment (recording a speaker, computing their reference embedding,
+                                        storing it) is the caller's responsibility. Only used when
+                                        speaker_verification is True. Can also be supplied/replaced later via
+                                        the SpeakerVerification.set_enrollments method on
+                                        model.speaker_verification.
+            speaker_verification_threshold (float): The cosine-similarity floor for a speaker match. Below this,
+                                                    the speaker is reported as unidentified ("").
+            speaker_verification_model (str): Which entry in openwakeword.SPEAKER_MODELS to use as the
+                                              speaker-embedding backend. Default "campplus_sv" (3D-Speaker
+                                              CAM++, 192-dim).
             inference_framework (str): The inference framework to use when for model prediction. Options are
                                        "tflite" or "onnx". The default is "tflite" as this results in better
                                        efficiency on common platforms (x86, ARM64), but in some deployment
                                        scenarios ONNX models may be preferable.
+            device (str): The device to run inference on, either "cpu" or "gpu" (default "cpu"). When "gpu"
+                          and the onnx inference framework is selected, every ONNX session (the wakeword
+                          models, the melspectrogram + embedding preprocessor models, and the VAD model)
+                          is created with the CUDAExecutionProvider, falling back to CPUExecutionProvider
+                          if CUDA is unavailable at runtime. Requires the `onnxruntime-gpu` package. Has
+                          no effect with the tflite inference framework.
             kwargs (dict): Any other keyword arguments to pass the the preprocessor instance
         """
         # Get model paths for pre-trained models if user doesn't provide models to load
@@ -150,8 +218,13 @@ class Model():
                 sessionOptions.inter_op_num_threads = 1
                 sessionOptions.intra_op_num_threads = 1
 
+                # When device == "gpu", prefer CUDA but keep CPU in the list as an
+                # explicit fallback so a host without a working CUDA provider still
+                # loads instead of raising.
+                wakeword_providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                                      if device == "gpu" else ["CPUExecutionProvider"])
                 self.models[mdl_name] = ort.InferenceSession(mdl_path, sess_options=sessionOptions,
-                                                             providers=["CPUExecutionProvider"])
+                                                             providers=wakeword_providers)
 
                 self.model_inputs[mdl_name] = self.models[mdl_name].get_inputs()[0].shape[1]
                 self.model_outputs[mdl_name] = self.models[mdl_name].get_outputs()[0].shape[1]
@@ -207,10 +280,40 @@ class Model():
         # Initialize Silero VAD
         self.vad_threshold = vad_threshold
         if vad_threshold > 0:
-            self.vad = openwakeword.VAD()
+            self.vad = openwakeword.VAD(device=device)
+
+        # Initialize optional speaker verification. Like the VAD above,
+        # this is constructed only when enabled — when disabled,
+        # self.speaker_verification is None, predict() never branches
+        # into the speaker path, and the (heavy) modelscope/torch
+        # dependencies are never imported.
+        self.speaker_verification_enabled = bool(speaker_verification)
+        self.speaker_verification = None
+        if self.speaker_verification_enabled:
+            if openwakeword.SpeakerVerification is None:
+                raise ImportError(
+                    "speaker_verification=True was requested, but the speaker "
+                    "verification dependencies are not installed. Install the "
+                    "`speaker-verification` extra: pip install "
+                    "openwakeword[speaker-verification]"
+                )
+            if speaker_verification_model not in openwakeword.SPEAKER_MODELS:
+                raise ValueError(
+                    f"unknown speaker_verification_model "
+                    f"{speaker_verification_model!r}; available: "
+                    f"{sorted(openwakeword.SPEAKER_MODELS)}"
+                )
+            modelscope_id = openwakeword.SPEAKER_MODELS[
+                speaker_verification_model
+            ]["modelscope_id"]
+            self.speaker_verification = openwakeword.SpeakerVerification(
+                enrollments=speaker_enrollments,
+                model_id=modelscope_id,
+                threshold=speaker_verification_threshold,
+            )
 
         # Create AudioFeatures object
-        self.preprocessor = AudioFeatures(inference_framework=inference_framework, **kwargs)
+        self.preprocessor = AudioFeatures(inference_framework=inference_framework, device=device, **kwargs)
 
     def get_parent_model_from_label(self, label):
         """Gets the parent model associated with a given prediction label"""
@@ -223,6 +326,33 @@ class Model():
 
         return parent_model
 
+    def get_providers(self):
+        """Report the execution provider(s) actually bound by every loaded ONNX session.
+
+        Useful for confirming GPU placement: a session created with the
+        CUDAExecutionProvider can silently fall back to the CPUExecutionProvider when
+        the CUDA libraries are missing or incompatible, and the only reliable signal is
+        what onnxruntime reports back after session creation.
+
+        Returns:
+            dict: A mapping of session name -> list of provider strings. Keys include
+                  each wakeword model name, "melspectrogram", "embedding", and "vad"
+                  (the last only when voice activity detection is enabled). Returns an
+                  empty dict for the tflite inference framework, which has no concept of
+                  onnxruntime execution providers.
+        """
+        providers = {}
+        for mdl_name, session in self.models.items():
+            if hasattr(session, "get_providers"):
+                providers[mdl_name] = session.get_providers()
+        if hasattr(self.preprocessor.melspec_model, "get_providers"):
+            providers["melspectrogram"] = self.preprocessor.melspec_model.get_providers()
+        if hasattr(self.preprocessor.embedding_model, "get_providers"):
+            providers["embedding"] = self.preprocessor.embedding_model.get_providers()
+        if self.vad_threshold > 0 and hasattr(self.vad.model, "get_providers"):
+            providers["vad"] = self.vad.model.get_providers()
+        return providers
+
     def reset(self):
         """Reset the prediction and audio feature buffers. Useful for re-initializing the model, though may not be efficient
         when called too frequently."""
@@ -230,7 +360,9 @@ class Model():
         self.preprocessor.reset()
 
     def predict(self, x: np.ndarray, patience: dict = {},
-                threshold: dict = {}, debounce_time: float = 0.0, timing: bool = False):
+                threshold: dict = {}, debounce_time: float = 0.0, timing: bool = False,
+                speaker_verification_seconds: float = 3.0,
+                return_result_object: bool = False):
         """Predict with all of the wakeword models on the input audio frames
 
         Args:
@@ -252,11 +384,27 @@ class Model():
                                    after a non-zero prediction. Can preven multiple detections of the same wake-word.
             timing (bool): Whether to return timing information of the models. Can be useful to debug and
                            assess how efficiently models are running on the current hardware.
+            speaker_verification_seconds (float): How many seconds of recent audio to run speaker verification
+                                                  over when a wake word fires (only used when speaker
+                                                  verification is enabled). The audio is pulled from the
+                                                  preprocessor's rolling buffer — i.e. the very audio the wake
+                                                  word fired on — so no re-capture is needed.
+            return_result_object (bool): Force predict() to return a PredictionResult object even when speaker
+                                         verification is disabled. By default predict() returns the classic
+                                         bare scores dict (or (dict, timing) tuple) when speaker verification
+                                         is off, for backwards compatibility; set this True to always get the
+                                         structured object.
 
         Returns:
-            dict: A dictionary of scores between 0 and 1 for each model, where 0 indicates no
-                  wake-word/wake-phrase detected. If the `timing` argument is true, returns a
-                  tuple of dicts containing model predictions and timing information, respectively.
+            By default, a dict of scores between 0 and 1 for each model, where 0 indicates no
+            wake-word/wake-phrase detected (and, if `timing` is true, a (scores, timing) tuple).
+
+            When speaker verification is enabled (or `return_result_object` is true), returns a
+            PredictionResult object instead: `.scores` is the same per-model score dict, and
+            `.speaker_id` / `.speaker_score` / `.speaker_quality` carry the speaker-verification
+            result for the wake word that fired this frame (empty / -1.0 / 0.0 when no wake word
+            fired or no enrolled speaker matched). If `timing` is also true, returns a
+            (PredictionResult, timing) tuple.
         """
         # Check input data type
         if not isinstance(x, np.ndarray):
@@ -379,6 +527,48 @@ class Model():
             for mdl in predictions.keys():
                 if vad_max_score < self.vad_threshold:
                     predictions[mdl] = 0.0
+
+        # Optional speaker verification. Runs only when enabled AND a
+        # wake word actually fired this frame — so the (relatively
+        # expensive) speaker-embedding inference is paid once per
+        # detection, not on every 80 ms frame. The audio it runs over
+        # is pulled from the preprocessor's own rolling buffer via
+        # get_raw_audio(): that is the exact audio the wake word fired
+        # on, including the wake word and the utterance onset, so there
+        # is no separate capture and no detection-latency gap.
+        speaker_id = ""
+        speaker_score = -1.0
+        speaker_quality = 0.0
+        if self.speaker_verification is not None:
+            if timing:
+                sv_start = time.time()
+            wake_fired = any(score >= 0.5 for score in predictions.values())
+            if wake_fired:
+                recent_audio = self.preprocessor.get_raw_audio(
+                    n_seconds=speaker_verification_seconds
+                )
+                if recent_audio.size > 0:
+                    speaker_id, speaker_score, speaker_quality = \
+                        self.speaker_verification.identify(recent_audio)
+            if timing:
+                timing_dict["models"]["speaker_verification"] = time.time() - sv_start
+
+        # Build the return value. Backwards compatible: when speaker
+        # verification is off and return_result_object was not set,
+        # predict() returns exactly what it always has — the bare
+        # scores dict, or a (scores, timing) tuple. When speaker
+        # verification is on (or the object is explicitly requested),
+        # the richer PredictionResult is returned instead.
+        if self.speaker_verification is not None or return_result_object:
+            result = PredictionResult(
+                scores=predictions,
+                speaker_id=speaker_id,
+                speaker_score=speaker_score,
+                speaker_quality=speaker_quality,
+            )
+            if timing:
+                return result, timing_dict
+            return result
 
         if timing:
             return predictions, timing_dict

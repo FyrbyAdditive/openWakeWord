@@ -114,6 +114,39 @@ All of the included openWakeWord models were trained to work well with a default
 
 If the baseline performance of openWakeWord models is not sufficient for a given application (specifically, if the false activation rate is unacceptably high), it is possible to train [custom verifier models](docs/custom_verifier_models.md) for specific voices that act as a second-stage filter on predictions (i.e., only allow activations through that were likely spoken by a known set of voices). This can greatly improve performance, at the cost of making the openWakeWord system less likely to respond to new voices.
 
+## Speaker Verification
+
+Where custom verifier models answer *"was this likely my user?"* as a yes/no filter, **speaker verification** answers *"which* enrolled speaker said it?"* — turning a wake event into a wake event *plus an identity*. This is useful when an application needs to act differently per person (personalised responses, per-user permissions) directly from the wake word, with no separate identification step.
+
+Speaker verification is fully optional and disabled by default. When disabled, none of its code runs and its (heavier) dependencies are never imported — a plain openWakeWord install is completely unaffected. To use it, install the extra:
+
+```
+pip install openwakeword[speaker-verification]
+```
+
+openWakeWord stays a pure-inference library: *enrollment* — recording a speaker, computing their reference embedding, storing it — is the application's responsibility. You hand the model a catalogue of pre-computed speaker embeddings, and openWakeWord does the embed-and-match when a wake word fires:
+
+```python
+import openwakeword
+
+owwModel = openwakeword.Model(
+    wakeword_models=["hey_jarvis"],
+    speaker_verification=True,
+    speaker_enrollments={
+        "alice": [alice_embedding],   # pre-computed reference embeddings
+        "bob":   [bob_embedding_1, bob_embedding_2],
+    },
+)
+
+result = owwModel.predict(audio_frame)
+# result.scores          -> {"hey_jarvis": 0.97}   (same as the classic dict)
+# result.speaker_id      -> "alice"                (or "" if unmatched / no wake)
+# result.speaker_score   -> 0.83                   (cosine similarity)
+# result.speaker_quality -> 0.61                   (RMS-energy estimate of the segment)
+```
+
+When speaker verification is enabled, `predict()` returns a `PredictionResult` object instead of the bare scores dict — `.scores` is exactly the dict you'd get otherwise, plus the speaker fields. With speaker verification **disabled**, `predict()` returns the classic dict unchanged, so existing code is not affected. See [docs/speaker_verification.md](docs/speaker_verification.md) for the full details, including how the speaker embedding reuses the audio the wake word already fired on.
+
 # Project Goals
 
 openWakeWord has four high-level goals, which combine to (hopefully!) produce a framework that is simple to use *and* extend.
