@@ -53,11 +53,16 @@ setuptools.setup(
         # optional pre-embed voice-activity trim. These are heavy deps
         # (torch), kept out of the base install — a plain openWakeWord user
         # who never enables speaker verification installs none of this.
-        # modelscope needs the [framework] extra for the pipeline runtime.
+        # modelscope needs the [framework] extra for the pipeline runtime;
+        # soundfile is required by modelscope's speaker-verification
+        # pipeline for audio I/O and is NOT pulled by [framework], so it
+        # must be listed explicitly (modelscope raises a hard ImportError
+        # for it at pipeline-construction time otherwise).
         'speaker-verification': [
                     'modelscope[framework]>=1.18',
                     'torch>=2.0',
                     'silero-vad>=5.1',
+                    'soundfile>=0.12',
                 ],
         'test': [
                     'onnxruntime>=1.10.0,<2',
