@@ -29,8 +29,13 @@ def build_additional_requires():
 setuptools.setup(
     name="openwakeword",
     version="0.6.0",
+    # NOTE (xavros fork): `onnxruntime` was moved out of `install_requires` into the
+    # `cpu` extra below. The stock library hard-pins `onnxruntime>=1.10.0,<2`, which
+    # forces the CPU-only wheel to be installed even alongside `onnxruntime-gpu` (the
+    # two share the `onnxruntime` import namespace and conflict). Downstreams that want
+    # GPU inference install `onnxruntime-gpu` themselves; downstreams that want the
+    # stock CPU behaviour install `openwakeword[cpu]`.
     install_requires=[
-        'onnxruntime>=1.10.0,<2',
         'ai-edge-litert>=2.0.2,<3; platform_system == "Linux" or platform_system == "Darwin"',
         'speexdsp-ns>=0.1.2,<1; platform_system == "Linux"',
         'tqdm>=4.0,<5.0',
@@ -39,7 +44,11 @@ setuptools.setup(
         'requests>=2.0,<3',
     ],
     extras_require={
+        'cpu': [
+                    'onnxruntime>=1.10.0,<2',
+                ],
         'test': [
+                    'onnxruntime>=1.10.0,<2',
                     'pytest>=7.2.0,<8',
                     'pytest-cov>=2.10.1,<3',
                     'pytest-flake8>=1.1.1,<2',

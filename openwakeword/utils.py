@@ -80,16 +80,21 @@ class AudioFeatures():
             sessionOptions.inter_op_num_threads = ncpu
             sessionOptions.intra_op_num_threads = ncpu
 
+            # When device == "gpu", prefer CUDA but keep CPU in the list as an explicit
+            # fallback so a host without a working CUDA provider still loads instead of
+            # raising.
+            onnx_providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                              if device == "gpu" else ["CPUExecutionProvider"])
+
             # Melspectrogram model
             self.melspec_model = ort.InferenceSession(melspec_model_path, sess_options=sessionOptions,
-                                                      providers=["CUDAExecutionProvider"] if device == "gpu" else ["CPUExecutionProvider"])
+                                                      providers=onnx_providers)
             self.onnx_execution_provider = self.melspec_model.get_providers()[0]
             self.melspec_model_predict = lambda x: self.melspec_model.run(None, {'input': x})
 
             # Audio embedding model
             self.embedding_model = ort.InferenceSession(embedding_model_path, sess_options=sessionOptions,
-                                                        providers=["CUDAExecutionProvider"] if device == "gpu"
-                                                        else ["CPUExecutionProvider"])
+                                                        providers=onnx_providers)
             self.embedding_model_predict = lambda x: self.embedding_model.run(None, {'input_1': x})[0].squeeze()
 
         elif inference_framework == "tflite":

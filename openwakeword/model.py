@@ -44,6 +44,7 @@ class Model():
             custom_verifier_models: dict = {},
             custom_verifier_threshold: float = 0.1,
             inference_framework: str = "tflite",
+            device: str = "cpu",
             **kwargs
             ):
         """Initialize the openWakeWord model object.
@@ -78,6 +79,12 @@ class Model():
                                        "tflite" or "onnx". The default is "tflite" as this results in better
                                        efficiency on common platforms (x86, ARM64), but in some deployment
                                        scenarios ONNX models may be preferable.
+            device (str): The device to run inference on, either "cpu" or "gpu" (default "cpu"). When "gpu"
+                          and the onnx inference framework is selected, every ONNX session (the wakeword
+                          models, the melspectrogram + embedding preprocessor models, and the VAD model)
+                          is created with the CUDAExecutionProvider, falling back to CPUExecutionProvider
+                          if CUDA is unavailable at runtime. Requires the `onnxruntime-gpu` package. Has
+                          no effect with the tflite inference framework.
             kwargs (dict): Any other keyword arguments to pass the the preprocessor instance
         """
         # Get model paths for pre-trained models if user doesn't provide models to load
@@ -150,8 +157,13 @@ class Model():
                 sessionOptions.inter_op_num_threads = 1
                 sessionOptions.intra_op_num_threads = 1
 
+                # When device == "gpu", prefer CUDA but keep CPU in the list as an
+                # explicit fallback so a host without a working CUDA provider still
+                # loads instead of raising.
+                wakeword_providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                                      if device == "gpu" else ["CPUExecutionProvider"])
                 self.models[mdl_name] = ort.InferenceSession(mdl_path, sess_options=sessionOptions,
-                                                             providers=["CPUExecutionProvider"])
+                                                             providers=wakeword_providers)
 
                 self.model_inputs[mdl_name] = self.models[mdl_name].get_inputs()[0].shape[1]
                 self.model_outputs[mdl_name] = self.models[mdl_name].get_outputs()[0].shape[1]
@@ -207,10 +219,10 @@ class Model():
         # Initialize Silero VAD
         self.vad_threshold = vad_threshold
         if vad_threshold > 0:
-            self.vad = openwakeword.VAD()
+            self.vad = openwakeword.VAD(device=device)
 
         # Create AudioFeatures object
-        self.preprocessor = AudioFeatures(inference_framework=inference_framework, **kwargs)
+        self.preprocessor = AudioFeatures(inference_framework=inference_framework, device=device, **kwargs)
 
     def get_parent_model_from_label(self, label):
         """Gets the parent model associated with a given prediction label"""
@@ -222,6 +234,33 @@ class Model():
                 parent_model = mdl
 
         return parent_model
+
+    def get_providers(self):
+        """Report the execution provider(s) actually bound by every loaded ONNX session.
+
+        Useful for confirming GPU placement: a session created with the
+        CUDAExecutionProvider can silently fall back to the CPUExecutionProvider when
+        the CUDA libraries are missing or incompatible, and the only reliable signal is
+        what onnxruntime reports back after session creation.
+
+        Returns:
+            dict: A mapping of session name -> list of provider strings. Keys include
+                  each wakeword model name, "melspectrogram", "embedding", and "vad"
+                  (the last only when voice activity detection is enabled). Returns an
+                  empty dict for the tflite inference framework, which has no concept of
+                  onnxruntime execution providers.
+        """
+        providers = {}
+        for mdl_name, session in self.models.items():
+            if hasattr(session, "get_providers"):
+                providers[mdl_name] = session.get_providers()
+        if hasattr(self.preprocessor.melspec_model, "get_providers"):
+            providers["melspectrogram"] = self.preprocessor.melspec_model.get_providers()
+        if hasattr(self.preprocessor.embedding_model, "get_providers"):
+            providers["embedding"] = self.preprocessor.embedding_model.get_providers()
+        if self.vad_threshold > 0 and hasattr(self.vad.model, "get_providers"):
+            providers["vad"] = self.vad.model.get_providers()
+        return providers
 
     def reset(self):
         """Reset the prediction and audio feature buffers. Useful for re-initializing the model, though may not be efficient
