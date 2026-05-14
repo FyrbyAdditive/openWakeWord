@@ -3,7 +3,20 @@ from openwakeword.model import Model
 from openwakeword.vad import VAD
 from openwakeword.custom_verifier_model import train_custom_verifier
 
-__all__ = ['Model', 'VAD', 'train_custom_verifier']
+# Speaker verification is an optional capability — its model backend
+# (3D-Speaker CAM++) and dependencies (modelscope, torch) live in the
+# `speaker-verification` extra. The import is guarded so a plain
+# openWakeWord install (without the extra) still imports cleanly;
+# `SpeakerVerification` is then None and Model raises a clear error if
+# speaker verification is requested without the extra installed.
+try:
+    from openwakeword.speaker_verification import SpeakerVerification
+    _HAS_SPEAKER_VERIFICATION = True
+except ImportError:
+    SpeakerVerification = None  # type: ignore[assignment,misc]
+    _HAS_SPEAKER_VERIFICATION = False
+
+__all__ = ['Model', 'VAD', 'train_custom_verifier', 'SpeakerVerification']
 
 FEATURE_MODELS = {
     "embedding": {
@@ -20,6 +33,21 @@ VAD_MODELS = {
     "silero_vad": {
         "model_path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources/models/silero_vad.onnx"),
         "download_url": "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/silero_vad.onnx"
+    }
+}
+
+# Speaker-verification model registry. Unlike MODELS / VAD_MODELS /
+# FEATURE_MODELS — which are ONNX/tflite files fetched from GitHub
+# release assets — the speaker-verification backend is a 3D-Speaker
+# CAM++ model distributed through modelscope. The modelscope SDK
+# fetches and caches it on first construction of SpeakerVerification,
+# so the registry records the `modelscope_id` rather than a
+# download_url. download_models() warms the modelscope cache when a
+# speaker model name is requested.
+SPEAKER_MODELS = {
+    "campplus_sv": {
+        "modelscope_id": "iic/speech_campplus_sv_zh-cn_16k-common",
+        "embedding_dim": 192,
     }
 }
 

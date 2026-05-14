@@ -47,6 +47,18 @@ setuptools.setup(
         'cpu': [
                     'onnxruntime>=1.10.0,<2',
                 ],
+        # Optional speaker verification (openwakeword.SpeakerVerification +
+        # Model(speaker_verification=True)). The 3D-Speaker CAM++ backend is
+        # distributed and run through modelscope; silero-vad provides the
+        # optional pre-embed voice-activity trim. These are heavy deps
+        # (torch), kept out of the base install — a plain openWakeWord user
+        # who never enables speaker verification installs none of this.
+        # modelscope needs the [framework] extra for the pipeline runtime.
+        'speaker-verification': [
+                    'modelscope[framework]>=1.18',
+                    'torch>=2.0',
+                    'silero-vad>=5.1',
+                ],
         'test': [
                     'onnxruntime>=1.10.0,<2',
                     'pytest>=7.2.0,<8',
